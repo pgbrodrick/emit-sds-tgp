@@ -31,6 +31,10 @@ Removing the need for the background calcluation eliminates this step, and it ha
 
 
 import argparse
+import functools
+import glob
+import shutil
+import tempfile
 import os, filecmp
 import numpy as np
 import json
@@ -41,6 +45,7 @@ from osgeo import gdal
 from rasterio.features import rasterize
 import logging
 from emit_main.workflow.workflow_manager import WorkflowManager
+import earthaccess
 import pandas as pd
 from typing import List
 import subprocess
@@ -52,17 +57,86 @@ from quantification import compute_flux, windspeed, compute_Q_and_uncertainty_ut
 gdal.osr.UseExceptions()
 
 
-def get_sds_cog(fid, enh_version, dtype='ch4', data_value=''):
+DAAC_ENH_ASSETS = {'': 'ENH', 'sens': 'SENS', 'uncert': 'UNCERT'}
+
+
+def ensure_earthaccess_login():
+    # earthaccess auth is per-process module state, so the login done in main() does not carry over
+    # into ray worker processes - re-establish it lazily wherever a download actually happens.
+    # Relies on a .netrc entry for urs.earthdata.nasa.gov
+    auth = getattr(earthaccess, '__auth__', None)
+    if auth is None or not getattr(auth, 'authenticated', False):
+        earthaccess.login(strategy='netrc')
+
+
+@functools.lru_cache(maxsize=None)
+def get_daac_enh_links(fid, collection_version, dtype):
+    short_name = f'EMITL2B{dtype.upper()}ENH'
+    # No '_' before the wildcard: V002 granule URs end in _<orbit>_<scene>, but V003 URs end at the timestamp
+    # (e.g. EMIT_L2B_CH4ENH_003_20230801T042909), so '..._*' would match nothing for V003.
+    granule_name = f'EMIT_L2B_{dtype.upper()}ENH_{collection_version}_{fid[4:12]}T{fid[13:19]}*'
+    results = earthaccess.search_data(short_name=short_name, version=collection_version, granule_name=granule_name)
+    if len(results) != 1:
+        raise RuntimeError(f'Expected 1 {short_name} granule matching {granule_name}, found {len(results)}')
+    return tuple(results[0].data_links())
+
+
+def download_to_cache(url, cache_dir):
+    local_path = os.path.join(cache_dir, os.path.basename(url))
+    if os.path.isfile(local_path):
+        logging.debug(f'Using cached {local_path}')
+        return local_path
+
+    # Download to a staging dir and rename, so an interrupted run can't leave a truncated file in the
+    # cache.  earthaccess skips any destination that already exists, so a partial file is never repaired,
+    # and a truncated COG still opens in GDAL - it only fails later, at read time.
+    ensure_earthaccess_login()
+    os.makedirs(cache_dir, exist_ok=True)
+    staging_dir = tempfile.mkdtemp(dir=cache_dir, prefix='.staging_')
+    try:
+        logging.info(f'Downloading {os.path.basename(url)} to cache')
+        downloaded = earthaccess.download([url], local_path=staging_dir)
+        # earthaccess logs (rather than raises) on many failures and returns an empty list or None entries
+        if not downloaded or downloaded[0] is None or not os.path.isfile(downloaded[0]):
+            raise RuntimeError(f'earthaccess failed to download {url}')
+        os.replace(downloaded[0], local_path)
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+    return local_path
+
+
+def get_sds_cog(fid, enh_version, dtype='ch4', data_value='', stream_data=False, cache_dir=None):
+    if stream_data:
+        collection_version = enh_version.lstrip('vV').zfill(3)
+        prefix = f'EMIT_L2B_{dtype.upper()}{DAAC_ENH_ASSETS[data_value]}_{collection_version}_'
+        fid_cache_dir = os.path.join(cache_dir, fid[4:12])
+
+        # Cache first: if this scene is already on disk, use it without touching CMR, so reruns are
+        # repeatable (and work offline) even if the DAAC later revises or reorganizes the granule.
+        cached = sorted(glob.glob(os.path.join(fid_cache_dir, f'{prefix}{fid[4:12]}T{fid[13:19]}*.tif')))
+        if len(cached) == 1:
+            logging.debug(f'Using cached {cached[0]}')
+            return cached[0]
+        if len(cached) > 1:
+            raise RuntimeError(f'Multiple cached {prefix}* assets for {fid}: {cached}')
+
+        links = [x for x in get_daac_enh_links(fid, collection_version, dtype) if os.path.basename(x).startswith(prefix)]
+        if len(links) != 1:
+            raise RuntimeError(f'Expected 1 {prefix}* asset for {fid}, found {len(links)}')
+        return download_to_cache(links[0], fid_cache_dir)
+
     date = fid[4:12]
     path=f'/store/emit/ops/data/acquisitions/{date}/{fid.split("_")[0]}/ghg/{dtype}/{fid.split("_")[0]}*_ghg_ort{data_value}{dtype}_b0106_{enh_version}.tif'
     return path
-   
+
 
 @click.command(name="scrape_refine_upload")
 @click.argument('key', type=str)
 @click.argument('id', type=str)
 @click.argument('out_dir', type=str)
 @click.argument('data_version', type=str)
+@click.option('--stream_data', is_flag=True, help='Download enhancement data from earthaccess instead of reading from the filesystem')
+@click.option('--cache_dir', type=str, default=None, help='Directory to cache downloaded enhancement data in, defaults to <out_dir>/enh_cache')
 @click.option('--enh_data_version', type=str, default='v02')
 @click.option('--gtype', type=click.Choice(['ch4','co2']), default='ch4')
 @click.option('--database_config', type=str,  default='/store/emit/ops/repos/emit-main/emit_main/config/ops_sds_config.json')
@@ -79,9 +153,9 @@ def get_sds_cog(fid, enh_version, dtype='ch4', data_value=''):
 @click.option('--software_build_version', type=str, default=None, help='overwrite current tag with this software build version')
 @click.option('--raw_annotation_override', type=str, default=None, help='ignore the key and id, and use this local file as the raw annotation input')
 @click.option('--sync_only', is_flag=True, help='Only sync data')
-def main(key: str, id: str, out_dir: str, data_version: str, enh_data_version: str, 
-         gtype: str, database_config: str, loglevel, logfile, continuous, track_coverage_file, 
-         plume_buffer_px, write_dcid_tifs, n_cores, num_dcids, specific_pid, sync_results, 
+def main(key: str, id: str, out_dir: str, data_version: str, stream_data: bool, cache_dir: str, enh_data_version: str,
+         gtype: str, database_config: str, loglevel, logfile, continuous, track_coverage_file,
+         plume_buffer_px, write_dcid_tifs, n_cores, num_dcids, specific_pid, sync_results,
          software_build_version, raw_annotation_override, sync_only):
 
     # make an args like object that holds the parameters
@@ -92,6 +166,8 @@ def main(key: str, id: str, out_dir: str, data_version: str, enh_data_version: s
     args.id = id
     args.out_dir = out_dir
     args.data_version = data_version
+    args.stream_data = stream_data
+    args.cache_dir = cache_dir if cache_dir is not None else os.path.join(out_dir, 'enh_cache')
     args.enh_data_version = enh_data_version
     args.type = gtype
     args.database_config = database_config
@@ -112,6 +188,12 @@ def main(key: str, id: str, out_dir: str, data_version: str, enh_data_version: s
 
     logging.basicConfig(format='%(levelname)s:%(asctime)s ||| %(message)s', level=args.loglevel,
                         filename=args.logfile, datefmt='%Y-%m-%d,%H:%M:%S')
+
+    if args.stream_data:
+        # Fail fast on bad credentials before doing any work
+        ensure_earthaccess_login()
+        os.makedirs(args.cache_dir, exist_ok=True)
+        logging.info(f'Caching downloaded enhancement data in {args.cache_dir}')
 
     np.random.seed(13)
     max_runs = 1
@@ -468,9 +550,9 @@ def process_dcid(dcid, manual_annotations, new_plumes, fn, args):
     fids_in_dcid = np.unique([sublist for x in plumes_idx_in_dcid for sublist in manual_annotations['features'][x]['properties']['fids']])
     logging.info(f'...found {len(plumes_idx_in_dcid)} plumes to update and {len(fids_in_dcid)} FIDs')
 
-    ort_dat_files = [get_sds_cog(fid, args.enh_data_version, dtype=args.type) for fid in fids_in_dcid]
-    ort_sens_files = [get_sds_cog(fid, args.enh_data_version, dtype=args.type, data_value='sens') for fid in fids_in_dcid]
-    unc_dat_files = [get_sds_cog(fid, args.enh_data_version, dtype=args.type, data_value='uncert') for fid in fids_in_dcid]
+    ort_dat_files = [get_sds_cog(fid, args.enh_data_version, dtype=args.type, stream_data=args.stream_data, cache_dir=args.cache_dir) for fid in fids_in_dcid]
+    ort_sens_files = [get_sds_cog(fid, args.enh_data_version, dtype=args.type, data_value='sens', stream_data=args.stream_data, cache_dir=args.cache_dir) for fid in fids_in_dcid]
+    unc_dat_files = [get_sds_cog(fid, args.enh_data_version, dtype=args.type, data_value='uncert', stream_data=args.stream_data, cache_dir=args.cache_dir) for fid in fids_in_dcid]
 
     dcid_ort_vrt_file = os.path.join(fn.proc_dir, f'dcid_{dcid}_mf_ort.vrt')
     dcid_ort_unc_vrt_file = os.path.join(fn.proc_dir, f'dcid_{dcid}_unc_ort.vrt')

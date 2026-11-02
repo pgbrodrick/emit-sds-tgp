@@ -115,7 +115,7 @@ def write_color_plume(rawdat, plumes_mask, glt_ds, outname: str, style = 'ch4'):
     colorized = (colorized * 255).astype(np.uint8)
     colorized[plumes_mask,:] = np.maximum(1, colorized[plumes_mask,:])
 
-    write_cog(outname, colorized, glt_ds, nodata_value=0)
+    write_cog(outname, colorized, glt_ds.GetGeoTransform(), glt_ds.GetProjection(), nodata_value=0)
 
 
 def write_color_quicklook(indat, output_file, inmask=None, trim=True, style='ch4'):
